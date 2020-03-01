@@ -19,3 +19,29 @@ def load_train_data(path='../data/training_data/training_nouns.tsv'):
     forbidden_id = set(ttest.SYNSET_ID)
     return ttrain, ttest_dev, ttest_test1, ttest_test2, ttest_hidden, forbidden_id
 
+
+def split_dict(
+        dataset,
+        train_share = 0.8,
+        dev_share = 0.02,
+        test1_share = 0.02,
+        test2_share = 0.02,
+        hid_share = 0.14,
+):
+    assert train_share + dev_share + test1_share + test2_share + hid_share == 1
+    train, dev, test1, test2, hid = {}, {}, {}, {}, {}
+
+    for k, v in dataset.items():
+        h = hash_float(k)
+        if h <= train_share:
+            train[k] = v
+        elif h <= train_share + dev_share:
+            dev[k] = v
+        elif h <= train_share + dev_share + test1_share:
+            test1[k] = v
+        elif h <= train_share + dev_share + test1_share + test2_share:
+            test2[k] = v
+        else:
+            hid[k] = v
+    forbidden_words = {w for s in [dev, test1, test2, hid] for w in s.keys()}
+    return train, dev, test1, test2, hid, forbidden_words

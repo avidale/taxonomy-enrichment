@@ -1,5 +1,7 @@
 from collections import Counter, defaultdict
-from sklearn.neighbors import KDTree
+from functools import lru_cache
+
+import xmltodict
 
 import numpy as np
 import pandas as pd
@@ -7,42 +9,91 @@ import pandas as pd
 
 from nltk import wordpunct_tokenize
 from string import punctuation
-
+from pymorphy2 import MorphAnalyzer
 
 from tqdm.auto import tqdm
+
+
+morphAnalyzer = MorphAnalyzer()
+
+
+@lru_cache(10_000)
+def word2pos(w):
+    parses = morphAnalyzer.parse(w)
+    if not parses:
+        return None
+    parse = parses[0]
+    if not parse.tag:
+        return None
+    if not parse.tag.POS:
+        return None
+    return parse.tag.POS
 
 
 def tokenize(text):
     return [t for t in wordpunct_tokenize(text.lower()) if not all(c in punctuation for c in t)]
 
 
-def normalize(v):
-    return v / sum(v**2)**0.5
+def normalize(v, epsilon=1e-10):
+    return v / (sum(v**2)**0.5 + epsilon)
 
 
 class SentenceEmbedder:
-    def __init__(self, ft, n=300):
+    def __init__(self, ft, n=300, normalize_word=True, pos_weights=None, default_weight=1):
         self.ft = ft
         self.n = n
+        self.normalize_word = normalize_word
+        self.pos_weights = pos_weights
+        self.default_weight = default_weight
 
     def __call__(self, text):
         tokens = tokenize(text)
-        vecs = [normalize(self.ft[w]) for w in tokens]
+        weights = self.get_word_weights(tokens)
+        vecs = [self.ft[word] for word in tokens]
+        if self.normalize_word:
+            vecs = [normalize(v) for v in vecs]
         if len(vecs) == 0:
             return np.zeros(self.n)
-        return normalize(sum(vecs))
+        return normalize(sum([vec * weight for vec, weight in zip(vecs, weights)]))
+
+    def get_word_weights(self, tokens):
+        if not self.pos_weights:
+            return [1] * len(tokens)
+        return [self.pos_weights.get(word2pos(t), self.default_weight) for t in tokens]
 
 
 class SynsetStorage:
-    def __init__(self, id2synset, ids, ids_long, texts_long):
+    def __init__(self, id2synset, ids, ids_long, texts_long, word2sense, forbidden_id=None):
         self.id2synset = id2synset
         self.ids = ids
         self.ids_long = ids_long
         self.texts_long = texts_long
+        self.word2sense = word2sense
+        self.forbidden_id = forbidden_id or set()
 
     @classmethod
-    def construct(cls, synsets_raw):
+    def construct(cls, synsets_raw, forbidden_words=None):
         id2synset = {v['@id']: v for v in synsets_raw['synsets']['synset']}
+
+        word2sense = defaultdict(set)
+
+        for synset_id, synset in id2synset.items():
+            senses = synset['sense']
+            if not isinstance(senses, list):
+                senses = [senses]
+            texts = {sense['#text'] for sense in senses}
+            texts.add(synset['@ruthes_name'])
+            for text in texts:
+                word2sense[text].add(synset_id)
+        print('number of texts:', len(word2sense))
+
+        forbidden_id = set()
+        for word in (forbidden_words or {}):
+            if word in word2sense:
+                for sense_id in word2sense[word]:
+                    forbidden_id.add(sense_id)
+        print('forbidden senses are', len(forbidden_id))
+
         ids = sorted(id2synset.keys())
         ids_long = []
         texts_long = []
@@ -53,43 +104,26 @@ class SynsetStorage:
                 senses = [senses]
             texts = {sense['#text'] for sense in senses}
             texts.add(s['@ruthes_name'])
+
+            # исключаем все слова, омонимичные с тем, что есть в тестовой выборке
+            senses = {synset_id for w in texts for synset_id in word2sense[w]}
+            if senses.intersection(forbidden_id):
+                continue
+
             if len(texts) > 1:
                 texts.add(' ; '.join(sorted(texts)))
             for text in sorted(texts):
                 ids_long.append(id)
                 texts_long.append(text)
-        print(len(ids), len(ids_long))
+        print('numer of ids', len(ids), 'long list is', len(ids_long))
         return cls(
             id2synset=id2synset,
             ids=ids,
             ids_long=ids_long,
             texts_long=texts_long,
+            word2sense=word2sense,
+            forbidden_id=forbidden_id,
         )
-
-# todo: implement this smarter way to construct index
-"""
-ids_long = []
-texts_long = []
-for id in ids:
-    s = id2synset[id]
-    senses = s['sense']
-    if not isinstance(senses, list):
-        senses = [senses]
-    texts = {sense['#text'] for sense in senses}
-    texts.add(s['@ruthes_name'])
-
-    # исключаем все слова, омонимичные с тем, что есть в тестовой выборке
-    senses = {synset_id for w in texts for synset_id in word2sense[w]}
-    if senses.intersection(forbidden_id):
-        continue
-
-    if len(texts) > 1:
-        texts.add(' ; '.join(sorted(texts)))
-    for text in sorted(texts):
-        ids_long.append(id)
-        texts_long.append(text)
-print(len(ids), len(ids_long))
-"""
 
 
 def make_rel_df(rel_n_raw, id2synset):
@@ -186,3 +220,18 @@ def dict2submission(word2hypotheses, id2synset):
             result_hyper_names.append(id2synset[hypo]['@ruthes_name'])
     result_df = pd.DataFrame({'noun': result_nouns, 'result': result_hyperonyms, 'result_text': result_hyper_names})
     return result_df
+
+
+def prepare_storages(synsets_filename, relations_filename, forbidden_words=None):
+    with open(synsets_filename, 'r', encoding='utf-8') as f:
+        synsets_raw = xmltodict.parse(f.read(), process_namespaces=True)
+    with open(relations_filename, 'r', encoding='utf-8') as f:
+        rel_raw = xmltodict.parse(f.read(), process_namespaces=True)
+
+    synset_storage = SynsetStorage.construct(synsets_raw, forbidden_words=forbidden_words or set())
+
+    rel_df = make_rel_df(rel_raw, synset_storage.id2synset)
+    rel_storage = RelationStorage(forbidden_id=synset_storage.forbidden_id)
+    rel_storage.construct_relations(rel_df)
+
+    return synset_storage, rel_storage, rel_df
