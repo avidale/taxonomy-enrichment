@@ -192,10 +192,10 @@ class RelationStorage:
 
 def hypotheses_knn(
         text,
-        index,
-        text2vec,
         synset_storage: SynsetStorage,
         rel_storage: RelationStorage,
+        index=None,
+        text2vec=None,
         k=10,
         verbose=False,
         decay=0,
@@ -203,12 +203,16 @@ def hypotheses_knn(
         result_size=10,
         return_hypotheses=False,
         neighbor_scorer=None,
+        indexer=None,
 ):
     ids_list = synset_storage.ids_long
     texts_list = synset_storage.texts_long
     # todo: distance decay
-    vec = text2vec(text)
-    distances, indices = index.query(vec.reshape(1, -1), k=k)
+    if indexer:
+        distances, indices = indexer.query(text, k=k)
+    else:
+        vec = text2vec(text)
+        distances, indices = index.query(vec.reshape(1, -1), k=k)
     hypotheses = Counter()
     for i, d in zip(indices.ravel(), distances.ravel()):
         hypers = rel_storage.id2hypernym.get(ids_list[i], set())
@@ -377,3 +381,20 @@ class W2VWrapper(BaseSentenceEmbedder):
             if keys:
                 return sum([self.w2v[k] for k in keys]) / len(keys)
         return np.zeros(self.n)
+
+
+class MixedIndexer:
+    def __init__(self, models, vectorizers, proportions, coefs):
+        self.models = models
+        self.vectorizers = vectorizers
+        self.proportions = proportions
+        self.coefs = coefs
+
+    def query(self, text, k=10):
+        all_distances, all_indices = [], []
+        for m, v, p, c in zip(self.models, self.vectorizers, self.proportions, self.coefs):
+            dis, ind = m.query(v(text).reshape(1, -1), k=max(1, int(k * p)))
+            all_distances.append(dis * c)
+            all_indices.append(ind)
+        # return all_distances, all_indices
+        return np.concatenate(all_distances, axis=1), np.concatenate(all_indices, axis=1)
