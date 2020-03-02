@@ -18,6 +18,14 @@ morphAnalyzer = MorphAnalyzer()
 
 
 @lru_cache(10_000)
+def morph_parse(w):
+    parses = morphAnalyzer.parse(w)
+    if not parses:
+        return None
+    return parses[0]
+
+
+@lru_cache(10_000)
 def word2pos(w):
     parses = morphAnalyzer.parse(w)
     if not parses:
@@ -38,18 +46,20 @@ def normalize(v, epsilon=1e-10):
     return v / (sum(v**2)**0.5 + epsilon)
 
 
-class SentenceEmbedder:
-    def __init__(self, ft, n=300, normalize_word=True, pos_weights=None, default_weight=1):
-        self.ft = ft
+class BaseSentenceEmbedder:
+    def __init__(self, n=300, normalize_word=True, pos_weights=None, default_weight=1):
         self.n = n
         self.normalize_word = normalize_word
         self.pos_weights = pos_weights
         self.default_weight = default_weight
 
+    def get_word_vec(self, word):
+        raise NotImplementedError()
+
     def __call__(self, text):
         tokens = tokenize(text)
         weights = self.get_word_weights(tokens)
-        vecs = [self.ft[word] for word in tokens]
+        vecs = [self.get_word_vec(word) for word in tokens]
         if self.normalize_word:
             vecs = [normalize(v) for v in vecs]
         if len(vecs) == 0:
@@ -60,6 +70,15 @@ class SentenceEmbedder:
         if not self.pos_weights:
             return [1] * len(tokens)
         return [self.pos_weights.get(word2pos(t), self.default_weight) for t in tokens]
+
+
+class SentenceEmbedder(BaseSentenceEmbedder):
+    def __init__(self, ft, **kwargs):
+        super(SentenceEmbedder, self).__init__(**kwargs)
+        self.ft = ft
+
+    def get_word_vec(self, word):
+        return self.ft[word]
 
 
 class SynsetStorage:
@@ -171,7 +190,20 @@ class RelationStorage:
         print(sum(len(c) for c in self.id2hypernym.values()))
 
 
-def hypotheses_knn(text, index, text2vec, synset_storage: SynsetStorage, rel_storage: RelationStorage, k=10, verbose=False, decay=0, grand_mult=1):
+def hypotheses_knn(
+        text,
+        index,
+        text2vec,
+        synset_storage: SynsetStorage,
+        rel_storage: RelationStorage,
+        k=10,
+        verbose=False,
+        decay=0,
+        grand_mult=1,
+        result_size=10,
+        return_hypotheses=False,
+        neighbor_scorer=None,
+):
     ids_list = synset_storage.ids_long
     texts_list = synset_storage.texts_long
     # todo: distance decay
@@ -182,14 +214,22 @@ def hypotheses_knn(text, index, text2vec, synset_storage: SynsetStorage, rel_sto
         hypers = rel_storage.id2hypernym.get(ids_list[i], set())
         if verbose:
             print(d, 1, ids_list[i], texts_list[i], len(hypers))
+
+        if neighbor_scorer is not None:
+            neighbor_score = neighbor_scorer(text, texts_list[i])
+        else:
+            neighbor_score = 1
         for parent in hypers:
-            hypotheses[parent] += np.exp(-d**decay)
+            base_score = np.exp(-d**decay) * neighbor_score
+            hypotheses[parent] += base_score
             for grandparent in rel_storage.id2hypernym.get(parent, set()):
-                hypotheses[grandparent] += np.exp(-d**decay) * grand_mult
+                hypotheses[grandparent] += base_score * grand_mult
+    if return_hypotheses:
+        return hypotheses
     if verbose:
         print(len(hypotheses))
     result = []
-    for hypo, cnt in hypotheses.most_common(10):
+    for hypo, cnt in hypotheses.most_common(result_size):
         if verbose:
             print(cnt, hypo, synset_storage.id2synset[hypo]['@ruthes_name'])
         result.append(hypo)
@@ -235,3 +275,105 @@ def prepare_storages(synsets_filename, relations_filename, forbidden_words=None)
     rel_storage.construct_relations(rel_df)
 
     return synset_storage, rel_storage, rel_df
+
+
+def get_transitivity(text):
+    tags = [morphAnalyzer.parse(t)[0].tag for t in tokenize(text)]
+    trans = None
+    for tag in tags:
+        if tag.transitivity is not None:
+            trans = tag.transitivity
+            break
+    return trans
+
+
+def transitivity_rerank(hypos, word, id2synset, mul=1.01):
+    trans = get_transitivity(word)
+    if trans is None:
+        return hypos
+    new_hypos = Counter()
+    for hypo, score in hypos.items():
+        hypo_text = id2synset[hypo]['@ruthes_name']
+        ttrans = get_transitivity(hypo_text)
+        new_score = score
+        if ttrans is None:
+            pass
+        elif ttrans == trans:
+            new_score *= mul
+        else:
+            new_score /= mul
+        new_hypos[hypo] = new_score
+    return new_hypos
+
+
+def get_top(cntr, n=10):
+    return [k for k, v in cntr.most_common(n)]
+
+
+class W2VWrapper(BaseSentenceEmbedder):
+    POS_MAP = {
+        'INFN': 'VERB',
+        'ADJF': 'ADJ',
+        'ADVB': 'ADV',
+    }
+    POS_MISS = {
+        'PREP'
+    }
+
+    def __init__(self, w2v, morph=morph_parse, **kwargs):
+        super(W2VWrapper, self).__init__(**kwargs)
+        self.w2v = w2v
+        self.morph = morph
+        self.prefix2word = self.make_prefixes()
+
+    def make_prefixes(self):
+        prefix2word = defaultdict(set)
+        for w in self.w2v.vocab.keys():
+            for n in range(1, len(w) - 2):
+                prefix2word[w[:-n]].add(w)
+        prefix2word = {k: v for k, v in prefix2word.items()}
+        return prefix2word
+
+    def find_prefix(self, word, min_len=2):
+        mapping = self.prefix2word
+        if word in mapping:
+            return mapping[word]
+        for i in range(1, len(word) - min_len):
+            t = mapping.get(word[:-i])
+            if t is not None:
+                return t
+        return None
+
+    def get_text_vec(self, text, verbose=False):
+        toks = tokenize(text)
+        vecs = []
+        for tok in toks:
+            vecs.append(self.get_word_vec(word=tok, verbose=verbose))
+        if not vecs:
+            return np.zeros(self.w2v.vectors.shape[1])
+        return normalize(sum(vecs))
+
+    def get_word_vec(self, word, verbose=False):
+        parse = self.morph(word)
+        if not parse:
+            return np.zeros(self.n)
+        tag = parse.tag
+        if tag is None:
+            print('none POS for word "{}"'.format(word))
+            tag = '-'
+        new_pos = self.POS_MAP.get(tag.POS, tag.POS or '-')
+        if new_pos in self.POS_MISS:
+            return np.zeros(self.n)
+        key = word + '_' + new_pos
+        key2 = (parse.normal_form or word) + '_' + new_pos
+        if verbose:
+            print(key, key2, self.find_prefix(key))
+        if key in self.w2v.vocab:
+            return self.w2v[key]
+        elif key2 in self.w2v.vocab:
+            return self.w2v[key2]
+        else:
+            keys = self.find_prefix(key)
+            if keys:
+                return sum([self.w2v[k] for k in keys]) / len(keys)
+        return np.zeros(self.n)
