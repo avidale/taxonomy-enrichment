@@ -7,6 +7,7 @@ from collections import Counter
 import argparse
 import pandas as pd
 
+import os
 import hashlib
 
 
@@ -34,7 +35,10 @@ def get_definition(query, mobile=True, retries=10, retry_timeout=3.0):
             ))
             time.sleep(retry_timeout)
     soup = BeautifulSoup(t)
-    d = soup.find('div', {'id': 'mw-content-text'}).find('div')
+    content = soup.find('div', {'id': 'mw-content-text'})
+    if not content:
+        return 'no_c'
+    d = content.find('div')
     if not d:
         return 'no_d'
     if mobile:
@@ -49,22 +53,52 @@ def get_definition(query, mobile=True, retries=10, retry_timeout=3.0):
     return first_paragraph.replace(STRESS_CHAR, '').replace('\xa0', ' ')
 
 
+class CachedDownloader:
+    def __init__(self, downloader, cache_file=None):
+        self.cache_file = cache_file
+        if cache_file and os.path.exists(cache_file):
+            self.cache = pd.read_pickle(cache_file)
+        else:
+            self.cache = {}
+        self.downloader = downloader
+
+    def extract(self, text):
+        if text in self.cache:
+            return self.cache[text]
+        result = self.downloader(text)
+        self.cache[text] = result
+        return result
+
+    def collect_from_files(self, path):
+        for fn in os.listdir(path):
+            data = pd.read_pickle(os.path.join(path, fn))
+            print('Got {} definitions from file {}'.format(len(data), fn))
+            for k, v in data.items():
+                if v:
+                    self.cache[k] = v
+        print('Current cache size is {}'.format(len(self.cache)))
+
+    def dump(self, out_file=None):
+        if not out_file:
+            out_file = self.cache_file
+        if not out_file:
+            print('Could not dump cache because out_file is not specified')
+        with open(out_file, 'wb') as f:
+            pickle.dumps(self.cache, f)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--start', default=0, type=int)
     parser.add_argument('--end', default=761, type=int)
     parser.add_argument('--batch-size', default=1000, type=int)
     parser.add_argument('--threads', default=16, type=int)
+    parser.add_argument('-i', '--input', default='../data/training_data/training_nouns.tsv', type=str)
+    parser.add_argument('-o', '--output', default='training_nouns', type=str)
     args = parser.parse_args()
 
-    #public_test_nouns = pd.read_csv('../data/public_test/nouns_public.tsv', header=None, encoding='utf-8')
-    #public_test_nouns.columns = ['noun']
-    #nouns = public_test_nouns.noun
-
-    train_n = pd.read_csv('../data/training_data/training_nouns.tsv', sep='\t', encoding='utf-8')
-    train_n['one_text'] = train_n.TEXT.apply(lambda x: sorted(x.split(','), key=hash_float)[0])
-    nouns = train_n.one_text
-    #nouns = pd.read_pickle('ttest_dev.pkl').one_text
+    df = pd.read_csv(args.input, sep='\t', encoding='utf-8', header=None)
+    texts = df[0]  # first column
 
     # 8,  mobile: 16.1 / 100
     # 16, mobile: 11.8 / 100 (13.15 full)
@@ -76,7 +110,7 @@ if __name__ == '__main__':
         print('starting batch {}'.format(batch_id))
         first = batch_id * batch_size
         last = first + batch_size
-        words = nouns.iloc[first:last].tolist()
+        words = texts.iloc[first:last].tolist()
         if not words:
             print('The doc is over!')
             break
@@ -85,6 +119,7 @@ if __name__ == '__main__':
         with multiprocessing.pool.ThreadPool(args.threads) as pool:  # vs pool.ThreadPool vs Pool
             docs = pool.map(get_definition, words)
         t1 = time.time()
+        result = {text: definition for text, definition in zip (words, docs)}
         print('Batch {}.\ntime elapsed: {}'.format(batch_id, t1 - t0))
-        with open('cache/wiki_train_{}_{}.pkl'.format(first, last), 'wb') as f:
-            pickle.dump(docs, f)
+        with open('cache/wiki_{}_{}_{}.pkl'.format(args.output, first, last), 'wb') as f:
+            pickle.dump(result, f)

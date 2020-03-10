@@ -1,45 +1,12 @@
-from collections import Counter, defaultdict
-from functools import lru_cache
-
 import xmltodict
-
 import numpy as np
 import pandas as pd
 
-
-from nltk import wordpunct_tokenize
-from string import punctuation
-from pymorphy2 import MorphAnalyzer
-
+from functools import lru_cache
+from collections import Counter, defaultdict
 from tqdm.auto import tqdm
 
-
-morphAnalyzer = MorphAnalyzer()
-
-
-@lru_cache(10_000)
-def morph_parse(w):
-    parses = morphAnalyzer.parse(w)
-    if not parses:
-        return None
-    return parses[0]
-
-
-@lru_cache(10_000)
-def word2pos(w):
-    parses = morphAnalyzer.parse(w)
-    if not parses:
-        return None
-    parse = parses[0]
-    if not parse.tag:
-        return None
-    if not parse.tag.POS:
-        return None
-    return parse.tag.POS
-
-
-def tokenize(text):
-    return [t for t in wordpunct_tokenize(text.lower()) if not all(c in punctuation for c in t)]
+from nlp import morph_parse, word2pos, tokenize, morphAnalyzer
 
 
 def normalize(v, epsilon=1e-10):
@@ -56,6 +23,7 @@ class BaseSentenceEmbedder:
     def get_word_vec(self, word):
         raise NotImplementedError()
 
+    @lru_cache(maxsize=1024)
     def __call__(self, text):
         tokens = tokenize(text)
         weights = self.get_word_weights(tokens)
@@ -144,6 +112,9 @@ class SynsetStorage:
             forbidden_id=forbidden_id,
         )
 
+    def get_synset_name(self, synset_id):
+        return self.id2synset.get(synset_id, {}).get('@ruthes_name', '-')
+
 
 def make_rel_df(rel_n_raw, id2synset):
     rel_df = pd.DataFrame(rel_n_raw['relations']['relation'])
@@ -216,15 +187,15 @@ def hypotheses_knn(
     hypotheses = Counter()
     for i, d in zip(indices.ravel(), distances.ravel()):
         hypers = rel_storage.id2hypernym.get(ids_list[i], set())
-        if verbose:
-            print(d, 1, ids_list[i], texts_list[i], len(hypers))
 
         if neighbor_scorer is not None:
             neighbor_score = neighbor_scorer(text, texts_list[i])
         else:
             neighbor_score = 1
+        base_score = np.exp(-d ** decay) * neighbor_score
+        if verbose:
+            print(d, 1, ids_list[i], texts_list[i], len(hypers), np.exp(-d ** decay),  base_score)
         for parent in hypers:
-            base_score = np.exp(-d**decay) * neighbor_score
             hypotheses[parent] += base_score
             for grandparent in rel_storage.id2hypernym.get(parent, set()):
                 hypotheses[grandparent] += base_score * grand_mult
