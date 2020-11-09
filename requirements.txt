@@ -1,0 +1,10 @@
+pandas
+numpy 
+scikit-learn
+gensim
+razdel
+pymorphy2
+pymorphy2-dicts-ru
+tqdm
+xmltodict
+nltk 
