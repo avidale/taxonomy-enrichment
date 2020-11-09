@@ -295,11 +295,12 @@ class W2VWrapper(BaseSentenceEmbedder):
         'PREP'
     }
 
-    def __init__(self, w2v, morph=morph_parse, **kwargs):
+    def __init__(self, w2v, morph=morph_parse, add_pos=True, **kwargs):
         super(W2VWrapper, self).__init__(**kwargs)
         self.w2v = w2v
         self.morph = morph
         self.prefix2word = self.make_prefixes()
+        self.add_pos = add_pos
 
     def make_prefixes(self):
         prefix2word = defaultdict(set)
@@ -327,7 +328,7 @@ class W2VWrapper(BaseSentenceEmbedder):
         if not vecs:
             return np.zeros(self.w2v.vectors.shape[1])
         return normalize(sum(vecs))
-
+    
     def get_word_vec(self, word, verbose=False):
         parse = self.morph(word)
         if not parse:
@@ -339,8 +340,11 @@ class W2VWrapper(BaseSentenceEmbedder):
         new_pos = self.POS_MAP.get(tag.POS, tag.POS or '-')
         if new_pos in self.POS_MISS:
             return np.zeros(self.n)
-        key = word + '_' + new_pos
-        key2 = (parse.normal_form or word) + '_' + new_pos
+        key = word
+        key2 = parse.normal_form or word
+        if self.add_pos:
+            key = key + '_' + new_pos
+            key2 = key2 + '_' + new_pos 
         if verbose:
             print(key, key2, self.find_prefix(key))
         if key in self.w2v.vocab:
